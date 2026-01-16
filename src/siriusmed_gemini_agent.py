@@ -1,10 +1,13 @@
 """
 SiriusMed LiveKit Voice Agent
 ==============================
-Voice assistant for SiriusMed landing page demo with VoxCPM Nigerian-accent TTS.
+Voice assistant for SiriusMed landing page demo.
+Connects to TTS server via WebSocket for Nigerian-accent audio.
 Only discusses SiriusMed features - no medical advice.
 """
 
+import asyncio
+import json
 import logging
 import os
 import random
@@ -12,168 +15,79 @@ import time
 from datetime import datetime
 
 import numpy as np
-import torch
+import websockets
 from dotenv import load_dotenv
 
-# Disable symlinks on Windows to avoid permission errors
-os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession, RunContext
 from livekit.agents.llm import function_tool
 from livekit.agents.tts import TTS
-from voxcpm import VoxCPM
-from voxcpm.model.voxcpm import VoxCPMModel, LoRAConfig
 
-# Monkeypatch VoxCPM to fix a bug in version 1.5.0 where warm-up runs even if optimize=False
-# and to make it more robust on CPU.
-def patched_voxcpm_init(self, voxcpm_model_path, zipenhancer_model_path="iic/speech_zipenhancer_ans_multiloss_16k_base", 
-                       enable_denoiser=True, optimize=True, lora_config=None, lora_weights_path=None):
-    if lora_weights_path is not None and lora_config is None:
-        lora_config = LoRAConfig(enable_lm=True, enable_dit=True, enable_proj=False)
+# Load environment variables
+env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+if os.path.exists(env_path):
+    load_dotenv(env_path)
+else:
+    load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# TTS server configuration
+TTS_SERVER_URL = os.getenv("TTS_SERVER_URL", "ws://127.0.0.1:9001")
+SAMPLE_RATE = 24000
+
+
+class WebSocketTTSEngine(TTS):
+    """TTS engine that communicates with standalone TTS server via WebSocket."""
     
-    self.tts_model = VoxCPMModel.from_local(voxcpm_model_path, optimize=optimize, lora_config=lora_config)
-    
-    if lora_weights_path is not None:
-        self.tts_model.load_lora_weights(lora_weights_path)
-    
-    self.text_normalizer = None
-    if enable_denoiser and zipenhancer_model_path is not None:
-        try:
-            from voxcpm.zipenhancer import ZipEnhancer
-            self.denoiser = ZipEnhancer(zipenhancer_model_path)
-        except Exception:
-            logging.warning("Failed to load denoiser, proceeding without it.")
-            self.denoiser = None
-    else:
-        self.denoiser = None
-        
-    # Skip warm-up when optimize=False since it's only needed for optimization
-    if optimize:
-        print("Warm up VoxCPMModel...")
-        try:
-            # Short warm-up to check if CPU SDPA yields IndexError
-            self.tts_model.generate(target_text="Warmup", max_len=5)
-        except Exception as e:
-            logging.warning(f"VoxCPM warm-up failed: {e}. This is common on CPU. Proceeding...")
-
-VoxCPM.__init__ = patched_voxcpm_init
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_ID = "dicksonsarpong9/voxcpm_nigeria_accent"
-
-voxcpm_model = None
-SAMPLE_RATE = None
-
-try:
-    print(f"Loading VoxCPM model: {MODEL_ID} on {DEVICE}...")
-    # Set optimize=False to skip internal torch.compile and we'll skip the heavy warm-up
-    voxcpm_model = VoxCPM.from_pretrained(MODEL_ID, optimize=False)
-    
-    if hasattr(voxcpm_model, "to"):
-        voxcpm_model.to(DEVICE)
-    
-    # Force float32 on CPU to avoid bfloat16 SDPA bugs
-    if DEVICE == "cpu":
-        voxcpm_model.tts_model.float()
-        
-    # Call eval on the internal tts_model, not the wrapper
-    if hasattr(voxcpm_model, "tts_model"):
-        voxcpm_model.tts_model.eval()
-        for p in voxcpm_model.tts_model.parameters():
-            p.requires_grad = False
-
-    SAMPLE_RATE = voxcpm_model.tts_model.sample_rate
-except Exception as e:
-    logging.error(f"Failed to load VoxCPM model: {e}")
-    print(f"Falling back to base model openbmb/VoxCPM-0.5B due to error: {e}")
-    try:
-        voxcpm_model = VoxCPM.from_pretrained("openbmb/VoxCPM-0.5B", optimize=False)
-        if DEVICE == "cpu":
-            voxcpm_model.tts_model.float()
-        if hasattr(voxcpm_model, "tts_model"):
-            voxcpm_model.tts_model.eval()
-            for p in voxcpm_model.tts_model.parameters():
-                p.requires_grad = False
-        SAMPLE_RATE = voxcpm_model.tts_model.sample_rate
-    except Exception as fallback_e:
-        logging.error(f"Critical: Failed to load fallback model: {fallback_e}")
-        raise fallback_e
-
-if voxcpm_model is None or SAMPLE_RATE is None:
-    raise RuntimeError("Failed to initialize VoxCPM model and sample rate")
-
-
-
-class VoxCPMTTSEngine(TTS):
-    def __init__(self, model, sample_rate=24000):
+    def __init__(self, server_url: str = "ws://127.0.0.1:9001", sample_rate: int = 24000):
         super().__init__(sample_rate=sample_rate, num_channels=1)
-        self.model = model
+        self.server_url = server_url
         self.sample_rate = sample_rate
         # Frame size: 50ms chunks for streaming
         self.frame_size = int(self.sample_rate * 0.05)
 
     async def synthesize(self, text: str):
-        """Synthesize text to speech and yield audio frames in chunks."""
+        """Connect to TTS server, get audio, yield as frames."""
         try:
-            # Yield silence first immediately to keep LiveKit happy while generating
-            # This prevents endpointing timeout on slow CPU inference
-            silence = np.zeros(int(self.sample_rate * 0.02), dtype=np.int16)
-            yield rtc.AudioFrame(
-                data=silence.tobytes(),
-                sample_rate=self.sample_rate,
-                num_channels=1,
-                samples_per_channel=len(silence),
-            )
+            logger.info(f"Synthesizing via WebSocket: {text[:50]}...")
             
-            # Generate audio with reduced settings for CPU performance
-            with torch.inference_mode():
-                wav = self.model.generate(
-                    text=text,
-                    cfg_value=1.5,  # Reduced from 2.0 for faster inference
-                    inference_timesteps=6,  # Reduced from 10 for CPU speed
-                    normalize=False,
-                    denoise=False,
-                    retry_badcase=False,  # Disabled for CPU speed
-                )
-
-            if isinstance(wav, torch.Tensor):
-                wav = wav.cpu().numpy()
-
-            if len(wav.shape) > 1:
-                wav = wav.squeeze()
-
-            if wav.dtype == np.float32 or wav.dtype == np.float64:
-                wav_max = np.abs(wav).max()
-                if wav_max > 1.0:
-                    wav = wav / wav_max
-
-            audio_int16 = (wav * 32767).astype(np.int16)
-
-            # Chunk audio into 50ms frames for proper streaming
-            for i in range(0, len(audio_int16), self.frame_size):
-                chunk = audio_int16[i:i + self.frame_size]
-                frame = rtc.AudioFrame(
-                    data=chunk.tobytes(),
+            async with websockets.connect(self.server_url) as ws:
+                # Send synthesis request
+                await ws.send(json.dumps({"text": text}))
+                
+                # Receive audio bytes
+                audio_bytes = await ws.recv()
+                
+                # Yield silence first to signal presence
+                silence = np.zeros(int(self.sample_rate * 0.02), dtype=np.int16)
+                yield rtc.AudioFrame(
+                    data=silence.tobytes(),
                     sample_rate=self.sample_rate,
                     num_channels=1,
-                    samples_per_channel=len(chunk),
+                    samples_per_channel=len(silence),
                 )
-                yield frame
                 
+                # Convert bytes to int16 array
+                audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+                
+                # Chunk audio into 50ms frames for streaming
+                for i in range(0, len(audio_int16), self.frame_size):
+                    chunk = audio_int16[i:i + self.frame_size]
+                    frame = rtc.AudioFrame(
+                        data=chunk.tobytes(),
+                        sample_rate=self.sample_rate,
+                        num_channels=1,
+                        samples_per_channel=len(chunk),
+                    )
+                    yield frame
+                    
+                logger.info("✓ Audio synthesis complete")
+
         except Exception as e:
-            logging.error(f"TTS synthesis failed: {e}")
+            logger.error(f"TTS synthesis failed: {e}")
             raise
-
-
-import os
-
-# Load environment variables from .env file if it exists
-env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-if os.path.exists(env_path):
-    load_dotenv(env_path)
-else:
-    load_dotenv()  # Fall back to searching in standard locations
-
 
 class SiriusAssistant(Agent):
     """SiriusMed voice assistant - discusses platform features only."""
@@ -440,7 +354,7 @@ async def entrypoint(ctx: agents.JobContext):
     session = AgentSession(
         stt="auto:en",
         llm="google/gemini-2.0-flash-lite",
-        tts=VoxCPMTTSEngine(model=voxcpm_model, sample_rate=SAMPLE_RATE),
+        tts=WebSocketTTSEngine(server_url=TTS_SERVER_URL, sample_rate=SAMPLE_RATE),
         min_endpointing_delay=0.03,
         max_endpointing_delay=0.8,
     )
@@ -452,7 +366,7 @@ async def entrypoint(ctx: agents.JobContext):
         nonlocal last_user_speech_end
         if msg.old_state == "speaking" and msg.new_state == "listening":
             last_user_speech_end = time.time()
-            print(f"DEBUG: User finished speaking at {last_user_speech_end}")
+            logger.info(f"User finished speaking at {last_user_speech_end}")
 
     @session.on("agent_state_changed")
     def on_agent_state(msg):
@@ -461,7 +375,7 @@ async def entrypoint(ctx: agents.JobContext):
             now = time.time()
             if last_user_speech_end > 0:
                 latency_ms = (now - last_user_speech_end) * 1000
-                print(f"LATENCY: Voice-to-Voice: {latency_ms:.2f}ms")
+                logger.info(f"LATENCY: Voice-to-Voice: {latency_ms:.2f}ms")
                 last_user_speech_end = 0.0
 
     await session.start(agent=SiriusAssistant(), room=ctx.room)
@@ -479,9 +393,4 @@ async def entrypoint(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
-    agents.cli.run_app(
-        agents.WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            proc_initializer_timeout=60,  # Increase timeout to 60 seconds for VoxCPM model loading
-        )
-    )
+    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
